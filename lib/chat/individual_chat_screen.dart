@@ -31,10 +31,12 @@ class _IndividualChatScreenState extends State<IndividualChatScreen> {
   final TextEditingController _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final ImagePicker _picker = ImagePicker();
+  List<dynamic> displayItems = [];
 
   List<MessageModel> _messages = [];
   bool _isLoading = false;
   bool _isSending = false;
+  MessageModel? _editingMessage;
   StreamSubscription? _firebaseMessagesSubscription;
 
   // Pagination
@@ -70,7 +72,9 @@ class _IndividualChatScreenState extends State<IndividualChatScreen> {
       );
       if (mounted) {
         setState(() {
+          
          _messages = messages;
+         displayItems = _buildDisplayListWithDates(_messages);
         _isLoading = false;
         _canLoadMore = messages.length == _messagesPerPage;
         });
@@ -94,7 +98,9 @@ class _IndividualChatScreenState extends State<IndividualChatScreen> {
     );
       if (mounted) {
         setState(() {
+          
           _messages.insertAll(0, olderMessagesFromDb);
+          displayItems = _buildDisplayListWithDates(_messages);
         _isLoadingMore = false;
         _canLoadMore = olderMessagesFromDb.length == _messagesPerPage;
         });
@@ -161,6 +167,9 @@ class _IndividualChatScreenState extends State<IndividualChatScreen> {
         } else if (change.type == DocumentChangeType.removed) {
            if (existingLocalMessage != null) {
              await DatabaseHelper.instance.deleteMessageByLocalId(existingLocalMessage.id!); // or mark as deleted
+             setState(() {
+               displayItems = _buildDisplayListWithDates(_messages);
+             });
              newMessagesAdded = true; // Force refresh
              print("Message $serverMessageId from Firestore REMOVED from SQLite");
            }
@@ -184,6 +193,8 @@ class _IndividualChatScreenState extends State<IndividualChatScreen> {
       if (mounted) {
         setState(() {
           _messages = currentMessages;
+          displayItems = _buildDisplayListWithDates(_messages);
+          
         });
         _scrollToBottom(isAnimated: true);
       }
@@ -194,6 +205,8 @@ class _IndividualChatScreenState extends State<IndividualChatScreen> {
 // ... (other parts of your _sendMessage function) ...
 
 Future<void> _sendMessage({String? text, XFile? imageFile}) async {
+
+  
   _messageController.clear(); // Clear input field after sending
   if ((text == null || text.isEmpty) && imageFile == null) return;
   if (_isSending) return;
@@ -227,6 +240,7 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
   final savedOptimisticMessage = await DatabaseHelper.instance.createMessage(optimisticMessage);
   if(mounted) {
     setState(() {
+      displayItems = _buildDisplayListWithDates(_messages);
       _messages.add(savedOptimisticMessage);
     });
     _scrollToBottom();
@@ -269,6 +283,7 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
       setState(() {
         final index = _messages.indexWhere((m) => m.id == finalMessage.id);
         if (index != -1) _messages[index] = finalMessage;
+        displayItems = _buildDisplayListWithDates(_messages);
         // _isSending should ideally be set to false after all operations, including thread update
       });
     }
@@ -284,9 +299,7 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
       'whoSent': CurrentUser.currentUserUid,
       'whoReceived': widget.otherUserUid,
       'messageType': messageType,
-      'lastMessageId': tempMessageId, // <-- ADDED THIS LINE: Store the ID of the message just sent
-      // Ensure participants are also set/merged correctly if this could be a new thread
-      // 'participants': [CurrentUser.currentUserUid, widget.otherUserUid], // Example
+      'lastMessageId': tempMessageId,
       'lastUpdatedAt': FieldValue.serverTimestamp(), // Good practice to track updates
     }, SetOptions(merge: true)); // merge:true is important to not overwrite other fields like 'participants'
 
@@ -316,6 +329,7 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
       setState(() {
         final index = _messages.indexWhere((m) => m.id == failedMessage.id);
         if (index != -1) _messages[index] = failedMessage;
+        displayItems = _buildDisplayListWithDates(_messages);
         _isSending = false;
       });
       ScaffoldMessenger.of(context).showSnackBar(
@@ -363,6 +377,93 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
           dateA.day == dateB.day;
   }
 
+  Future<void> _saveEditedMessage() async {
+  if (_editingMessage == null || _messageController.text.trim().isEmpty) {
+    // If no message is being edited or the text is empty after trimming
+    _cancelEditing(); // Just cancel the editing mode
+    return;
+  }
+
+  if (!mounted) return; // Check if the widget is still mounted
+
+  final String editedText = _messageController.text.trim();
+  final MessageModel originalMessage = _editingMessage!;
+  final DateTime now = DateTime.now(); // Timestamp for the edit
+
+  // 1. Optimistically update local DB and UI
+  final MessageModel updatedLocalMessage = originalMessage.copyWith(
+    messageText: editedText,
+    status: 'sent', // Or 'editing'/'edited' status locally? Depends on your UI needs.
+    editedAt: now, // Mark the edit timestamp
+    operation: 'edited', // Add an operation flag
+  );
+
+  try {
+    // Update the message in the local database (assuming updateMessage uses the local 'id')
+    await DatabaseHelper.instance.updateMessage(updatedLocalMessage);
+
+    // Update the UI list
+    if (mounted) {
+      setState(() {
+        final index = _messages.indexWhere((m) => m.id == originalMessage.id);
+        if (index != -1) {
+          _messages[index] = updatedLocalMessage;
+        }
+        displayItems = _buildDisplayListWithDates(_messages);
+        // Clear editing state
+        _editingMessage = null;
+        _messageController.clear();
+      });
+      _scrollToBottom(); // Optional: Scroll to bottom if the edited message is near the bottom
+    }
+
+    DocumentReference messageDocRef = FirebaseFirestore.instance
+        .collection('chats')
+        .doc(originalMessage.chatRoomId) // Use the correct chatRoomId
+        .collection('messages')
+        .doc(originalMessage.messageId); // Use the Firestore messageId
+
+    await messageDocRef.update({
+      'text': editedText,
+      'editedAt': Timestamp.fromDate(now),
+      'operation': 'edited',
+    });
+
+     await FirebaseFirestore.instance
+        .collection('chats')
+        .doc(originalMessage.chatRoomId)
+        .set({
+          // Check if this is still the latest message before updating summary fields
+          'lastMessage': editedText, // Update last message text
+          'timeStamp': Timestamp.fromDate(originalMessage.timestamp), // Keep original timestamp for sorting threads
+          // 'whoSent', 'whoReceived', 'messageType', 'lastMessageId' ideally don't change on edit
+           'lastUpdatedAt': FieldValue.serverTimestamp(), // Update the overall thread update time
+        }, SetOptions(merge: true));
+
+    if (mounted) {
+       // _isSending state is usually not used for editing, but if you had one, reset it here
+    }
+
+  } catch (e) {
+    print("Error saving edited message to Firebase: $e");
+    if (mounted) {
+       setState(() {
+        _editingMessage = null;
+        _messageController.clear();
+       });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to save edited message: $e')),
+      );
+    }
+  }
+}
+
+  _cancelEditing() {
+    setState(() {
+      _editingMessage = null;
+      _messageController.clear();
+    });
+  }
 
   List<dynamic> _buildDisplayListWithDates(List<MessageModel> messages) {
     if (messages.isEmpty) return [];
@@ -379,11 +480,11 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
     return displayList;
   }
 
-
   // In _IndividualChatScreenState
   Widget _buildDateSeparator(DateTime date) {
     return Center(
       child: Container(
+        key: ValueKey(date), // Unique key for each date
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         margin: const EdgeInsets.symmetric(vertical: 10),
         decoration: BoxDecoration(
@@ -402,7 +503,7 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
     );
   }
 
-  Widget _buildMessageItem(MessageModel message) {
+  Widget _buildMessageItem(MessageModel message,{Key? key}) {
     print("Building message item for ${message.messageId}");
     final bool isMe = message.isOutgoing;
     final alignment = isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start;
@@ -412,6 +513,7 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
     // Handle deleted messages
     if (message.operation == 'deleted') {
       return Container(
+        key: key,
         margin: const EdgeInsets.symmetric(vertical: 4.0, horizontal: 8.0),
         child: Row(
             mainAxisAlignment: isMe ? MainAxisAlignment.end : MainAxisAlignment.start,
@@ -427,6 +529,7 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
 
 
     Widget messageContent;
+
     if (message.messageType == 'image') {
       messageContent = message.localPath != null && File(message.localPath!).existsSync()
           ? Image.file(File(message.localPath!), width: 200, height: 200, fit: BoxFit.cover)
@@ -456,8 +559,15 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
                   leading: const Icon(Icons.edit),
                   title: const Text('Edit'),
                   onTap: () {
-                    // Handle edit action
                     Navigator.pop(context);
+
+                    setState(() {
+                      _editingMessage = message;
+                      _messageController.text = message.messageText ?? '';
+                      _messageController.selection = TextSelection.fromPosition(
+                        TextPosition(offset: _messageController.text.length),
+                      );
+                    });
                   },
                 ),
                 ListTile(
@@ -469,6 +579,7 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
 
                     DatabaseHelper.instance.deleteMessageForEveryone(message);
                     setState(() {
+                      displayItems = _buildDisplayListWithDates(_messages);
                       _messages.remove(message);
                     });
                     Navigator.pop(context);
@@ -539,7 +650,6 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
   @override
   Widget build(BuildContext context) {
 
-    final List<dynamic> displayItems = _buildDisplayListWithDates(_messages);
     // String otherUserName = widget.otherUserName; // Use passed name
     String otherUserName = widget.otherUserUid; // Placeholder: get actual name via a provider or another DB call
 
@@ -585,7 +695,7 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
                 if (item is DateTime) { // itemがDateTime型なら日付セパレーター
                   return _buildDateSeparator(item);
                 } else if (item is MessageModel) { // itemがMessageModel型ならメッセージバブル
-                  return _buildMessageItem(item);
+                  return _buildMessageItem(item, key: ValueKey(item.messageId));
                 }
                 return const SizedBox.shrink(); //念のため
               },
@@ -629,9 +739,39 @@ Future<void> _sendMessage({String? text, XFile? imageFile}) async {
                     textCapitalization: TextCapitalization.sentences,
                   ),
                 ),
+                if (_editingMessage != null) // If we are editing a message
+                Row( // Wrap in Row to potentially add a cancel button
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.check), // Save button
+                      color: Theme.of(context).primaryColor,
+                      onPressed: () {
+                        // Call the save edit function
+                        _saveEditedMessage();
+                      },
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.cancel), // Cancel button
+                      color: Colors.grey,
+                      onPressed: () {
+                        // Call the cancel edit function
+                        _cancelEditing();
+                      },
+                    ),
+                  ],
+                )
+              else // If we are sending a new message
                 IconButton(
-                  icon: Icon(Icons.send, color: _isSending ? Colors.grey : Colors.deepPurple),
-                  onPressed: _isSending ? null : () => _sendMessage(text: _messageController.text),
+                  icon: const Icon(Icons.send), // Send button
+                  color: Theme.of(context).primaryColor,
+                  onPressed: () {
+                    // Call the original send message function
+                    // Make sure to check _messageController.text is not empty before sending
+                    if (_messageController.text.trim().isNotEmpty) {
+                      _sendMessage(text: _messageController.text);
+                    }
+                  },
                 ),
               ],
             ),
