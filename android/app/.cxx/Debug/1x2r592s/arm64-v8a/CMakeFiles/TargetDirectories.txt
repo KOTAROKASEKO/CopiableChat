@@ -1,0 +1,2 @@
+C:/Users/USER/Desktop/university/FYP/chatapp/android/app/.cxx/Debug/1x2r592s/arm64-v8a/CMakeFiles/edit_cache.dir
+C:/Users/USER/Desktop/university/FYP/chatapp/android/app/.cxx/Debug/1x2r592s/arm64-v8a/CMakeFiles/rebuild_cache.dir
